@@ -65,19 +65,21 @@ RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.0"
 
 ## Configuration
 
-**1. Add the virtual model.** It is a regular model entry. Point it at the model that
-should answer whenever the AI Router does not decide, usually your cost-efficient
-default:
+**1. Add the virtual model.** It is a regular model entry. Point it at the model you
+rely on today, the one you trust to solve your requests, typically a frontier model.
+It answers whenever the AI Router does not decide, so a request without a decision is
+handled exactly as before. The AI Router moves a request to another model only when it
+has evidence that this model fits:
 
 ```yaml
 model_list:
   - model_name: airouter-auto
     litellm_params:
-      model: azure/my-gpt-5-mini-deployment
+      model: azure/my-gpt-5-2-deployment
       api_base: https://my-resource.openai.azure.com
       api_key: os.environ/AZURE_API_KEY
     model_info:
-      base_model: azure/gpt-5-mini
+      base_model: azure/gpt-5.2
 
   # ... your other deployments, unchanged
 ```
