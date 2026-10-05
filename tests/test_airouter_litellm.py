@@ -237,3 +237,77 @@ async def test_retryable_report_errors_keep_the_queue(monkeypatch):
     assert await cb.flush() is False and len(cb._reports) == 1
     fake.report_status = 202
     assert await cb.flush() is True and len(cb._reports) == 0
+
+
+# -- latency budget
+
+
+class SlowAiRouter(FakeAiRouter):
+    def __init__(self, catalog_delay=0.0, select_delay=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.catalog_delay, self.select_delay = catalog_delay, select_delay
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        import asyncio
+
+        if request.url.path == "/v1/models":
+            await asyncio.sleep(self.catalog_delay)
+        if request.url.path == "/v1/select":
+            await asyncio.sleep(self.select_delay)
+        return self.handler(request)
+
+
+def make_slow_callback(fake, monkeypatch, timeout_s):
+    cb = ar.AiRouterSelection(
+        settings=ar.Settings(api_key="test", base_url="https://airouter.test", select_timeout_s=timeout_s),
+        transport=httpx.MockTransport(fake.async_handler),
+    )
+    router = real_router(MODEL_LIST)
+    monkeypatch.setattr(ar.AiRouterSelection, "_proxy_router", staticmethod(lambda: router))
+    return cb
+
+
+def test_default_timeout_is_two_seconds():
+    assert ar.Settings(api_key="k").select_timeout_s == 2.0
+    assert ar.Settings.from_env({"AIROUTER_API_KEY": "k"}).select_timeout_s == 2.0
+
+
+async def test_slow_decision_falls_back_within_budget(monkeypatch):
+    import time
+
+    fake = SlowAiRouter(select_delay=1.0)
+    cb = make_slow_callback(fake, monkeypatch, timeout_s=0.3)
+    started = time.monotonic()
+    data = await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion")
+    assert data["model"] == "airouter-auto"
+    assert "metadata" not in data
+    assert time.monotonic() - started < 0.6
+
+
+async def test_stale_catalog_is_refreshed_in_background(monkeypatch):
+    import asyncio
+    import time
+
+    fake = SlowAiRouter(pick="gpt-5.2")
+    cb = make_slow_callback(fake, monkeypatch, timeout_s=0.5)
+    assert (await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion"))["model"] == "big"
+    fake.catalog_delay = 2.0
+    cb._catalog_at = -1e9  # catalog is stale now
+    started = time.monotonic()
+    data = await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion")
+    assert data["model"] == "big"  # served from the previous catalog
+    assert time.monotonic() - started < 0.4
+    assert cb._catalog_task is not None and not cb._catalog_task.done()
+    cb._catalog_task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_first_catalog_load_survives_a_budget_timeout(monkeypatch):
+    import asyncio
+
+    fake = SlowAiRouter(pick="gpt-5.2", catalog_delay=0.4)
+    cb = make_slow_callback(fake, monkeypatch, timeout_s=0.2)
+    assert (await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion"))["model"] == "airouter-auto"
+    await asyncio.sleep(0.4)  # the fetch was shielded and finishes in the background
+    assert cb._catalog
+    assert (await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion"))["model"] == "big"

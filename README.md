@@ -55,12 +55,12 @@ Install into the environment the proxy runs in, or into your own image based on 
 LiteLLM image:
 
 ```bash
-pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.0"
+pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.1"
 ```
 
 ```dockerfile
 FROM ghcr.io/berriai/litellm:<version>
-RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.0"
+RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.1"
 ```
 
 ## Configuration
@@ -100,7 +100,7 @@ If you already have callbacks, add it to the list:
 | --- | --- | --- | --- |
 | `AIROUTER_API_KEY` | yes | | API key of your AI Router organization |
 | `AIROUTER_VIRTUAL_MODEL` | no | `airouter-auto` | Name of the virtual model |
-| `AIROUTER_SELECT_TIMEOUT_MS` | no | `1000` | Time budget for the selection; when exceeded, the default model answers |
+| `AIROUTER_SELECT_TIMEOUT_MS` | no | `2000` | Time budget for the whole selection step; when exceeded, the default model answers |
 | `AIROUTER_MODEL_MAP` | no | | JSON object from AI Router model name to your model name, e.g. `{"claude-4-5-sonnet": "vertex-sonnet"}` |
 | `AIROUTER_EXCLUDE_MODELS` | no | | Comma-separated model names that must never be selected |
 | `AIROUTER_LOG_LEVEL` | no | | `INFO` logs every selection, `WARNING` only problems |

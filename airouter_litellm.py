@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - allows unit tests without litellm
             pass
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 logger = logging.getLogger("airouter_litellm")
 if os.environ.get("AIROUTER_LOG_LEVEL"):
@@ -71,7 +71,7 @@ class Settings:
     api_key: str
     base_url: str = "https://api.airouter.io"
     virtual_model: str = "airouter-auto"
-    select_timeout_s: float = 1.0
+    select_timeout_s: float = 2.0
     model_map: dict[str, str] = field(default_factory=dict)
     exclude_models: frozenset[str] = frozenset()
     catalog_ttl_s: float = 600.0
@@ -100,7 +100,7 @@ class Settings:
             api_key=api_key,
             base_url=env.get("AIROUTER_BASE_URL", cls.base_url).rstrip("/"),
             virtual_model=env.get("AIROUTER_VIRTUAL_MODEL", cls.virtual_model),
-            select_timeout_s=float(env.get("AIROUTER_SELECT_TIMEOUT_MS", "1000")) / 1000,
+            select_timeout_s=float(env.get("AIROUTER_SELECT_TIMEOUT_MS", "2000")) / 1000,
             model_map=model_map,
             exclude_models=exclude,
         )
@@ -269,6 +269,7 @@ class AiRouterSelection(CustomLogger):
         self._client: httpx.AsyncClient | None = None
         self._catalog: dict[str, str] = {}
         self._catalog_at = 0.0
+        self._catalog_task: asyncio.Task[None] | None = None
         self._mapping: Mapping | None = None
         self._mapping_at = 0.0
         self._warned_unmapped: set[str] = set()
@@ -298,12 +299,9 @@ class AiRouterSelection(CustomLogger):
 
         return proxy_server.llm_router
 
-    async def _load_catalog(self) -> dict[str, str]:
-        now = time.monotonic()
-        if self._catalog and now - self._catalog_at < self.settings.catalog_ttl_s:
-            return self._catalog
+    async def _fetch_catalog(self) -> None:
         try:
-            response = await self._http().get("/v1/models", timeout=5.0)
+            response = await self._http().get("/v1/models", timeout=10.0)
             response.raise_for_status()
             catalog: dict[str, str] = {}
             for entry in response.json().get("data", []):
@@ -314,17 +312,30 @@ class AiRouterSelection(CustomLogger):
                 for alias in entry.get("aliases") or []:
                     if isinstance(alias, str):
                         catalog.setdefault(alias.lower(), model_id)
-            self._catalog, self._catalog_at = catalog, now
-        except Exception as exc:  # keep the last known catalog
+            self._catalog, self._catalog_at = catalog, time.monotonic()
+            self._mapping = None  # rebuild against the new catalog
+        except Exception as exc:  # keep the last known catalog, retry in 30 s
             logger.warning("airouter: catalog refresh failed, keeping previous catalog: %r", exc)
-            self._catalog_at = now - self.settings.catalog_ttl_s + 30.0
+            self._catalog_at = time.monotonic() - self.settings.catalog_ttl_s + 30.0
+
+    async def _load_catalog(self) -> dict[str, str]:
+        """Return the catalog without making a request wait for a refresh.
+
+        A stale catalog is refreshed in the background while requests keep using it. Only
+        the very first request after start waits for the catalog, inside the selection budget.
+        """
+        stale = time.monotonic() - self._catalog_at >= self.settings.catalog_ttl_s
+        if (not self._catalog or stale) and (self._catalog_task is None or self._catalog_task.done()):
+            self._catalog_task = asyncio.get_running_loop().create_task(self._fetch_catalog())
+        if not self._catalog and self._catalog_task is not None:
+            await asyncio.shield(self._catalog_task)  # a budget timeout must not cancel the fetch
         return self._catalog
 
     async def mapping(self, llm_router: Any) -> Mapping:
+        catalog = await self._load_catalog()  # cheap; starts a background refresh when stale
         now = time.monotonic()
         if self._mapping is not None and now - self._mapping_at < self.settings.mapping_ttl_s:
             return self._mapping
-        catalog = await self._load_catalog()
         deployments = list(getattr(llm_router, "model_list", None) or [])
         mapping = build_mapping(deployments, catalog, self.settings)
         for group in mapping.unmapped:
@@ -364,8 +375,19 @@ class AiRouterSelection(CustomLogger):
     # -- request path
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> dict:
+        # One budget for the whole selection step (catalog, access checks, decision), so
+        # AIROUTER_SELECT_TIMEOUT_MS is the most a request can ever wait for the AI Router.
+        # _select mutates data only after its last await, so a timeout leaves it untouched.
         try:
-            return await self._select(user_api_key_dict, data, str(getattr(call_type, "value", call_type)))
+            return await asyncio.wait_for(
+                self._select(user_api_key_dict, data, str(getattr(call_type, "value", call_type))),
+                timeout=self.settings.select_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "airouter: selection skipped: no decision within %.0f ms", self.settings.select_timeout_s * 1000
+            )
+            return data
         except Exception as exc:  # never break a request because of the AI Router
             logger.warning("airouter: selection skipped: %r", exc)
             return data
@@ -398,7 +420,7 @@ class AiRouterSelection(CustomLogger):
             body["max_tokens"] = max_tokens
 
         started = time.monotonic()
-        response = await self._http().post("/v1/select", json=body, timeout=settings.select_timeout_s)
+        response = await self._http().post("/v1/select", json=body, timeout=None)  # bounded by wait_for
         response.raise_for_status()
         decision = response.json()
         candidates = decision.get("candidates") or []
