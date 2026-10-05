@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airouter-litellm"
+version = "0.1.0"
+description = "AI Router model selection for LiteLLM proxies"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Heureka Labs" }]
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.25"]
+keywords = ["litellm", "llm", "model routing", "ai router"]
+
+[project.urls]
+Homepage = "https://airouter.io"
+Source = "https://github.com/heureka-labs/airouter-litellm"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio", "litellm[proxy]>=1.104"]
+
+[tool.setuptools]
+py-modules = ["airouter_litellm"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,19 @@
+# Mock deployments with customer-style names; base_model tells LiteLLM (and the plugin) what runs behind them.
+model_list:
+  - model_name: airouter-auto
+    litellm_params: {model: openai/prod-mini, api_key: fake, mock_response: "DEFAULT"}
+    model_info: {base_model: azure/gpt-5-mini}
+  - model_name: azure-mini-eu
+    litellm_params: {model: openai/prod-mini, api_key: fake, mock_response: "MINI"}
+    model_info: {base_model: azure/gpt-5-mini}
+  - model_name: azure-big-eu
+    litellm_params: {model: openai/prod-big, api_key: fake, mock_response: "BIG"}
+    model_info: {base_model: azure/gpt-5.2}
+  - model_name: vertex-sonnet
+    litellm_params: {model: openai/sonnet, api_key: fake, mock_response: "SONNET"}
+  - model_name: local-qwen
+    litellm_params: {model: hosted_vllm/Qwen/Qwen3-30B-A3B, api_base: "http://127.0.0.1:9", api_key: fake, mock_response: "QWEN"}
+litellm_settings:
+  callbacks: airouter_litellm.selection
+general_settings:
+  master_key: sk-test-1234
