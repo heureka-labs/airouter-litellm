@@ -29,11 +29,17 @@ r=$(curl -s localhost:4011/v1/responses "${H[@]}" -d '{"model":"airouter-auto","
 check "responses api routed" "$r" 'BIG'
 r=$(curl -s localhost:4011/v1/chat/completions "${H[@]}" -d '{"model":"azure-mini-eu","messages":[{"role":"user","content":"hi"}]}')
 check "direct model untouched" "$r" '"MINI"'
+r=$(curl -s localhost:4011/v1/chat/completions "${H[@]}" -d '{"model":"auto-quality","messages":[{"role":"user","content":"quality"}]}')
+check "second virtual model routed" "$r" '"BIG"'
+r=$(curl -s localhost:4011/v1/chat/completions "${H[@]}" -d '{"model":"project-cheap","messages":[{"role":"user","content":"cheap"}]}')
+check "project virtual model limited to its candidates" "$r" '"MINI"'
 sleep 8
 check "select got mapped catalog names" "$(grep SELECT "$LOG/airouter.log" | head -1)" '"models": \["gpt-5-mini", "gpt-5.2"\]'
+check "virtual model sent its weighting" "$(grep '"quality"' "$LOG/airouter.log" | grep SELECT)" '"weighting": {"quality": 3.0, "costs": 1.0, "latency": 0.5}'
+check "project virtual model sent only its candidate" "$(grep '"cheap"' "$LOG/airouter.log" | grep SELECT)" '"models": \["gpt-5-mini"\]'
 check "select got anthropic system text" "$(grep SELECT "$LOG/airouter.log")" '"content": "be brief"'
 n=$(grep -o '"report_id"' "$LOG/airouter.log" | wc -l)
-check "usage reports delivered (4 routed calls)" "$n" '^4$'
+check "usage reports delivered (6 routed calls)" "$n" '^6$'
 check "unmapped models logged" "$(cat "$LOG/proxy.log")" "'vertex-sonnet' has no AI Router catalog match"
 
 kill $FAKE; sleep 1

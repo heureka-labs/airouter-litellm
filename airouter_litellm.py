@@ -1,13 +1,18 @@
 """AI Router model selection for a LiteLLM proxy.
 
-Clients send requests to a virtual model (default name ``airouter-auto``). Before
-LiteLLM routes such a request, this callback asks the AI Router Decision API which
-model fits the prompt and rewrites the request to the matching deployment of this
-proxy. Keys, deployments, budgets and spend tracking stay in LiteLLM.
+Clients send requests to a virtual model. Any model_list entry with an ``airouter``
+block in its ``model_info`` is one, so a proxy can offer as many as it needs, each
+with its own candidate models and weighting (for example one per use case or per
+project). The entry named by ``AIROUTER_VIRTUAL_MODEL`` (default ``airouter-auto``)
+is a virtual model as well, with all models as candidates and the AI Router
+organization's weighting. Before LiteLLM routes a request to a virtual model, this
+callback asks the AI Router Decision API which candidate fits the prompt and
+rewrites the request to that model group. Keys, deployments, budgets and spend
+tracking stay in LiteLLM.
 
 Any failure (AI Router unreachable, timeout, no evidence, no allowed candidate)
 leaves the request on the virtual model, which is a regular model_list entry that
-points at the default model. The AI Router can therefore never block a request.
+points at its default model. The AI Router can therefore never block a request.
 
 After each executed call the token usage is queued and reported to
 ``/v1/usage-reports`` in the background, so the AI Router dashboard shows actual
@@ -25,6 +30,7 @@ read from environment variables, see README.md.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -43,7 +49,7 @@ except ImportError:  # pragma: no cover - allows unit tests without litellm
             pass
 
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 logger = logging.getLogger("airouter_litellm")
 if os.environ.get("AIROUTER_LOG_LEVEL"):
@@ -55,6 +61,10 @@ if os.environ.get("AIROUTER_LOG_LEVEL"):
 
 METADATA_DECISION_ID = "airouter_decision_id"
 METADATA_MODEL = "airouter_model"
+METADATA_VIRTUAL_MODEL = "airouter_virtual_model"
+
+CONFIG_KEY = "airouter"  # model_info block that makes a model_list entry a virtual model
+WEIGHTING_KEYS = frozenset({"quality", "costs", "latency"})
 
 # Call types this callback acts on. Everything else passes through untouched.
 CHAT_CALL_TYPES = frozenset({"completion", "acompletion"})
@@ -226,13 +236,15 @@ def build_mapping(
     aliases) in lower case to its catalog id. Explicit ``AIROUTER_MODEL_MAP`` entries
     (catalog name -> proxy model_name) take precedence over automatic matches. When two
     model groups resolve to the same catalog model, the first one in the model list wins.
+    Virtual models are never candidates themselves.
     """
+    virtual = find_virtual_models(deployments, settings)
     to_local: dict[str, str] = {}
     seen_groups: list[str] = []
     automatic: dict[str, str] = {}
     for deployment in deployments:
         group = deployment.get("model_name")
-        if not isinstance(group, str) or group == settings.virtual_model:
+        if not isinstance(group, str) or group in virtual:
             continue
         if group in settings.exclude_models:
             continue
@@ -258,6 +270,91 @@ def build_mapping(
     return Mapping(to_local=to_local, to_catalog=to_catalog, unmapped=unmapped)
 
 
+# ------------------------------------------------------------------- virtual models
+
+
+@dataclass(frozen=True)
+class VirtualModel:
+    """A model group whose requests the AI Router routes.
+
+    ``candidates`` are proxy model_names (None: every mapped model group), ``weighting``
+    the boost factors sent to the Decision API (None: the AI Router organization's
+    preferences). ``error`` is set when the ``airouter`` block is invalid; such a virtual
+    model is never routed and its requests stay on its default model.
+    """
+
+    name: str
+    candidates: tuple[str, ...] | None = None
+    weighting: dict[str, float] | None = None
+    default_identities: tuple[str, ...] = ()
+    error: str | None = None
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def parse_virtual_model(name: str, raw: Any, deployment: dict[str, Any]) -> VirtualModel:
+    """Validate one ``model_info.airouter`` block.
+
+    Accepted forms: absent or ``true`` (all models, organization weighting) or a mapping
+    with the optional keys ``models`` (list of proxy model_names) and ``weighting``
+    (``quality``, ``costs`` and ``latency``, each a non-negative number, all three required
+    as in the Decision API).
+    """
+    identities = tuple(model_identities(deployment.get("litellm_params") or {}, deployment.get("model_info") or {}))
+
+    def invalid(reason: str) -> VirtualModel:
+        return VirtualModel(name=name, default_identities=identities, error=reason)
+
+    if raw is None or raw is True:
+        return VirtualModel(name=name, default_identities=identities)
+    if not isinstance(raw, dict):
+        return invalid("model_info.airouter must be true or a mapping with 'models' and/or 'weighting'")
+    unknown = sorted(set(raw) - {"models", "weighting"})
+    if unknown:
+        return invalid(f"unknown key(s) in model_info.airouter: {', '.join(unknown)}")
+
+    candidates: tuple[str, ...] | None = None
+    if raw.get("models") is not None:
+        models = raw["models"]
+        if not isinstance(models, list) or not models or not all(isinstance(m, str) and m for m in models):
+            return invalid("model_info.airouter.models must be a non-empty list of model names")
+        candidates = tuple(dict.fromkeys(models))
+
+    weighting: dict[str, float] | None = None
+    if raw.get("weighting") is not None:
+        w = raw["weighting"]
+        if not isinstance(w, dict) or set(w) != WEIGHTING_KEYS or not all(_number(v) for v in w.values()):
+            return invalid(
+                "model_info.airouter.weighting needs quality, costs and latency, each a non-negative number"
+            )
+        weighting = {key: float(w[key]) for key in ("quality", "costs", "latency")}
+
+    return VirtualModel(name=name, candidates=candidates, weighting=weighting, default_identities=identities)
+
+
+def find_virtual_models(deployments: list[dict[str, Any]], settings: Settings) -> dict[str, VirtualModel]:
+    """Virtual models of the proxy: entries with an ``airouter`` block plus AIROUTER_VIRTUAL_MODEL.
+
+    The first deployment of a model group defines its configuration; give every deployment
+    of a virtual model group the same block.
+    """
+    found: dict[str, VirtualModel] = {}
+    for deployment in deployments:
+        name = deployment.get("model_name")
+        if not isinstance(name, str) or name in found:
+            continue
+        info = deployment.get("model_info") or {}
+        raw = info.get(CONFIG_KEY) if hasattr(info, "get") else None
+        if raw is None and name != settings.virtual_model:
+            continue
+        if raw is False:  # explicit opt-out, also for the AIROUTER_VIRTUAL_MODEL name
+            continue
+        found[name] = parse_virtual_model(name, raw, deployment)
+    return found
+
+
 # ------------------------------------------------------------------------ callback
 
 
@@ -273,6 +370,9 @@ class AiRouterSelection(CustomLogger):
         self._mapping: Mapping | None = None
         self._mapping_at = 0.0
         self._warned_unmapped: set[str] = set()
+        self._virtual: dict[str, VirtualModel] = {}
+        self._virtual_at: float | None = None
+        self._warned: set[str] = set()
         self._reports: deque[dict[str, Any]] = deque()
         self._flusher: asyncio.Task[None] | None = None
 
@@ -350,6 +450,44 @@ class AiRouterSelection(CustomLogger):
             self._mapping, self._mapping_at = mapping, now
         return mapping
 
+    def _warn_once(self, message: str, *args: Any, level: int = logging.WARNING) -> None:
+        key = message % args
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.log(level, message, *args)
+
+    def virtual_models(self, llm_router: Any) -> dict[str, VirtualModel]:
+        """Virtual models of the proxy, re-read with the mapping TTL (models added via UI or API)."""
+        now = time.monotonic()
+        if self._virtual_at is not None and now - self._virtual_at < self.settings.mapping_ttl_s:
+            return self._virtual
+        deployments = list(getattr(llm_router, "model_list", None) or [])
+        self._virtual, self._virtual_at = find_virtual_models(deployments, self.settings), now
+        for virtual in self._virtual.values():
+            if virtual.error:
+                self._warn_once(
+                    "airouter: virtual model %r is not routed, its requests stay on its default model: %s",
+                    virtual.name, virtual.error, level=logging.ERROR,
+                )
+        return self._virtual
+
+    def _candidate_groups(self, virtual: VirtualModel, mapping: Mapping) -> list[str]:
+        if virtual.candidates is None:
+            return list(mapping.to_catalog)
+        groups: list[str] = []
+        for group in virtual.candidates:
+            if group in mapping.to_catalog:
+                groups.append(group)
+            elif group in self._virtual:
+                self._warn_once("airouter: virtual model %r lists virtual model %r as a candidate, ignored",
+                                virtual.name, group)
+            else:
+                self._warn_once(
+                    "airouter: virtual model %r lists %r, which is no model group of this proxy with an AI Router "
+                    "catalog match (or is excluded), ignored", virtual.name, group,
+                )
+        return groups
+
     async def _allowed_groups(self, groups: list[str], user_api_key_dict: Any, llm_router: Any) -> list[str]:
         """Keep only model groups the calling key (and its team) may use.
 
@@ -394,17 +532,21 @@ class AiRouterSelection(CustomLogger):
 
     async def _select(self, user_api_key_dict: Any, data: dict, call_type: str) -> dict:
         settings = self.settings
-        if data.get("model") != settings.virtual_model or call_type not in SUPPORTED_CALL_TYPES:
+        requested = data.get("model")
+        if not isinstance(requested, str) or call_type not in SUPPORTED_CALL_TYPES:
+            return data
+        llm_router = self._proxy_router()
+        virtual = self.virtual_models(llm_router).get(requested)
+        if virtual is None or virtual.error:
             return data
         if not settings.api_key:
-            logger.warning("airouter: AIROUTER_API_KEY is not set, staying on %s", settings.virtual_model)
+            logger.warning("airouter: AIROUTER_API_KEY is not set, staying on %s", requested)
             return data
         messages = selection_messages(data)
         if not messages:
             return data
-        llm_router = self._proxy_router()
         mapping = await self.mapping(llm_router)
-        groups = await self._allowed_groups(list(mapping.to_catalog), user_api_key_dict, llm_router)
+        groups = await self._allowed_groups(self._candidate_groups(virtual, mapping), user_api_key_dict, llm_router)
         if not groups:
             return data
         body: dict[str, Any] = {
@@ -412,7 +554,9 @@ class AiRouterSelection(CustomLogger):
             "models": [mapping.to_catalog[g] for g in groups],
             "tools": bool(data.get("tools")),
         }
-        default_catalog = self._default_catalog_model(llm_router, mapping)
+        if virtual.weighting is not None:
+            body["weighting"] = dict(virtual.weighting)
+        default_catalog = self._default_catalog_model(virtual)
         if default_catalog in body["models"]:
             body["model"] = default_catalog
         max_tokens = _max_tokens(data)
@@ -428,7 +572,7 @@ class AiRouterSelection(CustomLogger):
             return data  # no evidence for this prompt: default model
         best = candidates[0]
         target = mapping.to_local.get(best.get("model"))
-        if target is None:
+        if target is None or target not in groups:
             return data
         data["model"] = target
         self._apply_effort(data, call_type, best.get("effort"))
@@ -436,25 +580,25 @@ class AiRouterSelection(CustomLogger):
         # forwarded upstream; LiteLLM's own request metadata lives in "litellm_metadata" there.
         metadata_key = "metadata" if call_type in CHAT_CALL_TYPES else "litellm_metadata"
         metadata = data.setdefault(metadata_key, {})
-        if isinstance(metadata, dict) and decision.get("decision_id"):
-            metadata[METADATA_DECISION_ID] = decision["decision_id"]
-            metadata[METADATA_MODEL] = best["model"]
+        if isinstance(metadata, dict):
+            # The rewrite replaces the requested model, so keep the virtual model visible in
+            # LiteLLM's spend logs and callbacks.
+            metadata[METADATA_VIRTUAL_MODEL] = virtual.name
+            if decision.get("decision_id"):
+                metadata[METADATA_DECISION_ID] = decision["decision_id"]
+                metadata[METADATA_MODEL] = best["model"]
         logger.info(
             "airouter: %s -> %s (%s) in %.0f ms",
-            settings.virtual_model, target, best.get("model"), (time.monotonic() - started) * 1000,
+            virtual.name, target, best.get("model"), (time.monotonic() - started) * 1000,
         )
         return data
 
-    def _default_catalog_model(self, llm_router: Any, mapping: Mapping) -> str | None:
-        """Catalog name of the model the virtual model points at, if it is mapped."""
-        for deployment in getattr(llm_router, "model_list", None) or []:
-            if deployment.get("model_name") != self.settings.virtual_model:
-                continue
-            params, info = deployment.get("litellm_params") or {}, deployment.get("model_info") or {}
-            for identity in model_identities(params, info):
-                catalog_id = self._catalog.get(identity.lower())
-                if catalog_id:
-                    return catalog_id
+    def _default_catalog_model(self, virtual: VirtualModel) -> str | None:
+        """Catalog name of the model a virtual model points at, if it is in the catalog."""
+        for identity in virtual.default_identities:
+            catalog_id = self._catalog.get(identity.lower())
+            if catalog_id:
+                return catalog_id
         return None
 
     @staticmethod

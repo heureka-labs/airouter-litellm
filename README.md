@@ -2,9 +2,13 @@
 
 [AI Router](https://airouter.io) model selection for your [LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy).
 
-Your applications send requests to one virtual model, `airouter-auto`. Before LiteLLM
-routes such a request, this callback asks the AI Router which of your models fits the
-prompt best for quality, cost and latency, and sends the request to that deployment.
+Your applications send requests to a virtual model, for example `airouter-auto`. Before
+LiteLLM routes such a request, this callback asks the AI Router which of your models fits
+the prompt best for quality, cost and latency, and sends the request to that deployment.
+
+- **As many virtual models as you need.** Each one has its own default model, its own
+  candidate models and its own weighting of quality, cost and latency: a few profiles
+  for different use cases, or one per project with the project's model setup.
 
 - **Your gateway stays in charge.** Provider keys, deployments, budgets, rate limits and
   spend tracking stay in LiteLLM. The completion runs on your own provider accounts.
@@ -55,34 +59,67 @@ Install into the environment the proxy runs in, or into your own image based on 
 LiteLLM image:
 
 ```bash
-pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.1"
+pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.2.0"
 ```
 
 ```dockerfile
 FROM ghcr.io/berriai/litellm:<version>
-RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.1.1"
+RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.2.0"
 ```
 
 ## Configuration
 
-**1. Add the virtual model.** It is a regular model entry. Point it at the model you
-rely on today, the one you trust to solve your requests, typically a frontier model.
-It answers whenever the AI Router does not decide, so a request without a decision is
-handled exactly as before. The AI Router moves a request to another model only when it
-has evidence that this model fits:
+**1. Add virtual models.** A virtual model is a regular model entry with an `airouter`
+block in its `model_info`. Point it at the model you rely on today for that kind of
+work, the one you trust to solve the requests, typically a frontier model. It answers
+whenever the AI Router does not decide, so a request without a decision is handled
+exactly as before. The AI Router moves a request to another model only when it has
+evidence that this model fits:
 
 ```yaml
 model_list:
-  - model_name: airouter-auto
+  # Quality first, choosing between two of your models
+  - model_name: auto-quality
     litellm_params:
       model: azure/my-gpt-5-2-deployment
       api_base: https://my-resource.openai.azure.com
       api_key: os.environ/AZURE_API_KEY
     model_info:
       base_model: azure/gpt-5.2
+      airouter:
+        models: [gpt-5-2-eu, gemini-flash]
+        weighting: {quality: 3, costs: 1, latency: 0.5}
+
+  # One project with its own model setup and your organization's weighting
+  - model_name: project-support-bot
+    litellm_params:
+      model: azure/my-gpt-5-mini-deployment
+      api_base: https://my-resource.openai.azure.com
+      api_key: os.environ/AZURE_API_KEY
+    model_info:
+      base_model: azure/gpt-5-mini
+      airouter:
+        models: [gpt-5-mini-eu, gemini-flash-lite]
 
   # ... your other deployments, unchanged
 ```
+
+The `airouter` block:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `models` | all models | `model_name`s of this proxy the AI Router may choose from. The calling key and team must also be allowed to use a model. |
+| `weighting` | your AI Router organization's preferences | Boost factors `quality`, `costs` and `latency`, all three, each a non-negative number. Higher means that dimension counts more. |
+
+`airouter: true` makes an entry a virtual model with all models and your organization's
+weighting. The entry named `airouter-auto` (or the name in `AIROUTER_VIRTUAL_MODEL`) is
+a virtual model of that kind even without the block, so configurations of version 0.1
+keep working; `airouter: false` switches it off. Virtual models are never candidates of
+other virtual models. A virtual model with an invalid block is not routed: its requests
+go to its default model and the proxy logs the reason once at `ERROR` level.
+
+Who may use which virtual model is regular LiteLLM model access: give a project's team or
+keys access to the project's virtual model and to its candidate models.
 
 **2. Register the callback:**
 
@@ -99,15 +136,16 @@ If you already have callbacks, add it to the list:
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `AIROUTER_API_KEY` | yes | | API key of your AI Router organization |
-| `AIROUTER_VIRTUAL_MODEL` | no | `airouter-auto` | Name of the virtual model |
+| `AIROUTER_VIRTUAL_MODEL` | no | `airouter-auto` | Name of the entry that is a virtual model even without an `airouter` block |
 | `AIROUTER_SELECT_TIMEOUT_MS` | no | `2000` | Time budget for the whole selection step; when exceeded, the default model answers |
 | `AIROUTER_MODEL_MAP` | no | | JSON object from AI Router model name to your model name, e.g. `{"claude-4-5-sonnet": "vertex-sonnet"}` |
 | `AIROUTER_EXCLUDE_MODELS` | no | | Comma-separated model names that must never be selected |
 | `AIROUTER_LOG_LEVEL` | no | | `INFO` logs every selection, `WARNING` only problems |
 | `AIROUTER_BASE_URL` | no | `https://api.airouter.io` | API endpoint |
 
-**4. Use it.** Point applications, or a team's default model, at `airouter-auto`.
-Requests to any other model are not touched.
+**4. Use it.** Point applications, or a team's default model, at a virtual model.
+Requests to any other model are not touched, so a workload that needs a fixed model
+simply calls that model by its name.
 
 ## Model mapping
 
@@ -137,8 +175,9 @@ and `litellm_params.model` with the AI Router catalog, after removing provider p
 ## What is sent to the AI Router
 
 - Per routed request: the text content of the messages (system, user, assistant and
-  tool text; images and files are left out), the names of the candidate models, whether
-  tools are present, and `max_tokens` if set.
+  tool text; images and files are left out), the names of the candidate models, the
+  virtual model's weighting if it sets one, whether tools are present, and `max_tokens`
+  if set.
 - Per executed call: decision id, model name, input and output token counts from the
   provider's usage, and latency.
 - Nothing about requests to other models, and never provider keys.
@@ -150,13 +189,13 @@ Start the proxy with `AIROUTER_LOG_LEVEL=INFO` and send a request:
 ```bash
 curl http://localhost:4000/v1/chat/completions \
   -H "Authorization: Bearer $LITELLM_KEY" -H "Content-Type: application/json" \
-  -d '{"model": "airouter-auto", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "auto-quality", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 The proxy log shows the decision:
 
 ```
-airouter_litellm INFO airouter: airouter-auto -> my-mini (gpt-5-mini) in 420 ms
+airouter_litellm INFO airouter: auto-quality -> gemini-flash (gemini-3.5-flash) in 420 ms
 ```
 
 `selection skipped` lines name the reason when the default model answered instead.
@@ -167,6 +206,9 @@ Routed calls appear in the AI Router dashboard.
 - **Reasoning effort.** If the AI Router selects an effort level, it is passed on as
   `reasoning_effort` (chat) or `reasoning.effort` (Responses API), unless the client set
   one itself. Anthropic-format requests keep the provider default.
+- **Which virtual model was called.** The rewrite replaces the requested model, so the
+  callback adds `airouter_virtual_model` to the request metadata, where other LiteLLM
+  callbacks can read it.
 - **Fallbacks.** If LiteLLM falls back to another model after the selection, usage is
   reported for the model that actually answered.
 - **Delivery of usage reports.** Reports are sent in batches every few seconds and

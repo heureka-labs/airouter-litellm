@@ -13,6 +13,19 @@ model_list:
     litellm_params: {model: openai/sonnet, api_key: fake, mock_response: "SONNET"}
   - model_name: local-qwen
     litellm_params: {model: hosted_vllm/Qwen/Qwen3-30B-A3B, api_base: "http://127.0.0.1:9", api_key: fake, mock_response: "QWEN"}
+  # Further virtual models, each with its own candidates and weighting.
+  - model_name: auto-quality
+    litellm_params: {model: openai/prod-big, api_key: fake, mock_response: "QUALITY-DEFAULT"}
+    model_info:
+      base_model: azure/gpt-5.2
+      airouter:
+        models: [azure-mini-eu, azure-big-eu]
+        weighting: {quality: 3, costs: 1, latency: 0.5}
+  - model_name: project-cheap
+    litellm_params: {model: openai/prod-mini, api_key: fake, mock_response: "CHEAP-DEFAULT"}
+    model_info:
+      base_model: azure/gpt-5-mini
+      airouter: {models: [azure-mini-eu]}
 litellm_settings:
   callbacks: airouter_litellm.selection
 general_settings:

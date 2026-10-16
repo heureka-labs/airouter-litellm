@@ -311,3 +311,117 @@ async def test_first_catalog_load_survives_a_budget_timeout(monkeypatch):
     await asyncio.sleep(0.4)  # the fetch was shielded and finishes in the background
     assert cb._catalog
     assert (await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion"))["model"] == "big"
+
+
+# -- several virtual models
+
+MULTI = MODEL_LIST + [
+    {"model_name": "auto-quality", "litellm_params": {"model": "azure/prod-big"},
+     "model_info": {"base_model": "azure/gpt-5.2",
+                    "airouter": {"models": ["big", "flash"], "weighting": {"quality": 3, "costs": 1, "latency": 0.5}}}},
+    {"model_name": "project-support", "litellm_params": {"model": "azure/prod-mini"},
+     "model_info": {"base_model": "azure/gpt-5-mini",
+                    "airouter": {"models": ["mini", "flash", "auto-quality", "nope"]}}},
+    {"model_name": "auto-all", "litellm_params": {"model": "azure/prod-big"},
+     "model_info": {"base_model": "azure/gpt-5.2", "airouter": True}},
+]
+
+
+def test_find_virtual_models_parses_blocks_and_keeps_the_env_model():
+    found = ar.find_virtual_models(MULTI, ar.Settings(api_key="k"))
+    assert set(found) == {"airouter-auto", "auto-quality", "project-support", "auto-all"}
+    assert found["airouter-auto"].candidates is None and found["airouter-auto"].weighting is None
+    assert found["auto-quality"].candidates == ("big", "flash")
+    assert found["auto-quality"].weighting == {"quality": 3.0, "costs": 1.0, "latency": 0.5}
+    assert found["auto-all"].candidates is None and found["auto-all"].error is None
+
+
+def test_env_virtual_model_can_be_switched_off():
+    models = [dict(MODEL_LIST[0], model_info={"base_model": "azure/gpt-5-mini", "airouter": False})] + MODEL_LIST[1:]
+    assert ar.find_virtual_models(models, ar.Settings(api_key="k")) == {}
+
+
+@pytest.mark.parametrize("block", [
+    "yes",
+    {"model": ["big"]},
+    {"models": []},
+    {"models": "big"},
+    {"weighting": {"quality": 1, "costs": 1}},
+    {"weighting": {"quality": -1, "costs": 1, "latency": 1}},
+    {"weighting": {"quality": True, "costs": 1, "latency": 1}},
+    {"weighting": {"quality": float("nan"), "costs": 1, "latency": 1}},
+])
+def test_invalid_blocks_are_reported(block):
+    entry = {"model_name": "bad", "litellm_params": {"model": "azure/x"}, "model_info": {"airouter": block}}
+    assert ar.find_virtual_models([entry], ar.Settings(api_key="k"))["bad"].error
+
+
+def test_virtual_models_are_never_candidates():
+    catalog = {e["id"].lower(): e["id"] for e in CATALOG["data"]}
+    mapping = ar.build_mapping(MULTI, catalog, ar.Settings(api_key="k"))
+    assert set(mapping.to_catalog) == {"mini", "big", "flash"}
+
+
+async def test_each_virtual_model_sends_its_own_candidates_and_weighting(monkeypatch):
+    fake = FakeAiRouter(pick="gemini-3.5-flash")
+    cb = make_callback(fake, monkeypatch, model_list=MULTI)
+    quality = await cb.async_pre_call_hook(MASTER, None, chat(model="auto-quality"), "acompletion")
+    support = await cb.async_pre_call_hook(MASTER, None, chat(model="project-support"), "acompletion")
+    legacy = await cb.async_pre_call_hook(MASTER, None, chat(), "acompletion")
+    q, s, legacy_body = fake.select_bodies
+    assert q["models"] == ["gpt-5.2", "gemini-3.5-flash"] and q["model"] == "gpt-5.2"
+    assert q["weighting"] == {"quality": 3.0, "costs": 1.0, "latency": 0.5}
+    assert s["models"] == ["gpt-5-mini", "gemini-3.5-flash"] and s["model"] == "gpt-5-mini"
+    assert "weighting" not in s and "weighting" not in legacy_body
+    assert set(legacy_body["models"]) == {"gpt-5-mini", "gpt-5.2", "gemini-3.5-flash"}
+    assert quality["model"] == support["model"] == legacy["model"] == "flash"
+    assert quality["metadata"][ar.METADATA_VIRTUAL_MODEL] == "auto-quality"
+    assert support["metadata"][ar.METADATA_VIRTUAL_MODEL] == "project-support"
+
+
+async def test_pick_outside_the_candidates_keeps_the_default(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = make_callback(fake, monkeypatch, model_list=MULTI)
+    original = fake.handler
+
+    def ignore_candidates(request):  # a decision for a model that was not offered
+        if request.url.path == "/v1/select":
+            fake.select_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"decision_id": "d-2", "predicted_savings": None, "candidates": [
+                {"model": "gpt-5-mini", "effort": None}]})
+        return original(request)
+
+    cb._transport = httpx.MockTransport(ignore_candidates)
+    data = await cb.async_pre_call_hook(MASTER, None, chat(model="auto-quality"), "acompletion")
+    assert data["model"] == "auto-quality"
+
+
+async def test_invalid_virtual_model_stays_on_default_without_a_decision(monkeypatch, caplog):
+    bad = MODEL_LIST + [{"model_name": "broken", "litellm_params": {"model": "azure/prod-big"},
+                         "model_info": {"airouter": {"weighting": {"quality": 1}}}}]
+    fake = FakeAiRouter()
+    cb = make_callback(fake, monkeypatch, model_list=bad)
+    with caplog.at_level("ERROR", logger="airouter_litellm"):
+        data = await cb.async_pre_call_hook(MASTER, None, chat(model="broken"), "acompletion")
+        await cb.async_pre_call_hook(MASTER, None, chat(model="broken"), "acompletion")
+    assert data["model"] == "broken" and fake.select_bodies == []
+    assert sum("'broken' is not routed" in r.getMessage() for r in caplog.records) == 1
+
+
+async def test_key_access_narrows_a_virtual_models_candidates(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = make_callback(fake, monkeypatch, model_list=MULTI)
+    key = UserAPIKeyAuth(api_key="sk-p", models=["project-support", "mini"])
+    data = await cb.async_pre_call_hook(key, None, chat(model="project-support"), "acompletion")
+    assert fake.select_bodies[0]["models"] == ["gpt-5-mini"] and data["model"] == "mini"
+
+
+async def test_unknown_candidates_are_logged_once(monkeypatch, caplog):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = make_callback(fake, monkeypatch, model_list=MULTI)
+    with caplog.at_level("WARNING", logger="airouter_litellm"):
+        for _ in range(2):
+            await cb.async_pre_call_hook(MASTER, None, chat(model="project-support"), "acompletion")
+    text = [r.getMessage() for r in caplog.records]
+    assert sum("lists 'nope'" in t for t in text) == 1
+    assert sum("lists virtual model 'auto-quality'" in t for t in text) == 1
