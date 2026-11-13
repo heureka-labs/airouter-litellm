@@ -26,7 +26,14 @@ model_list:
     model_info:
       base_model: azure/gpt-5-mini
       airouter: {models: [azure-mini-eu]}
+  # Observed in shadow mode; its deployment is unreachable, so LiteLLM falls back to azure-mini-eu.
+  - model_name: shadow-broken
+    litellm_params: {model: openai/prod-sonnet, api_base: "http://127.0.0.1:9", api_key: fake}
+    model_info: {base_model: claude-4-5-sonnet}
 litellm_settings:
   callbacks: airouter_litellm.selection
+router_settings:
+  fallbacks: [{shadow-broken: [azure-mini-eu]}]
+  num_retries: 0
 general_settings:
   master_key: sk-test-1234

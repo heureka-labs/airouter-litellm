@@ -49,7 +49,7 @@ class FakeAiRouter:
             self.select_bodies.append(body)
             if self.select_status != 200:
                 return httpx.Response(self.select_status, json={"detail": "error"})
-            if self.pick is None or self.pick not in body["models"]:
+            if self.pick is None or self.pick not in body.get("models", [self.pick]):
                 return httpx.Response(200, json={"decision_id": None, "candidates": [], "predicted_savings": None})
             return httpx.Response(200, json={
                 "decision_id": "d-1",
@@ -110,7 +110,9 @@ def test_settings_from_env():
     s = ar.Settings.from_env({"AIROUTER_API_KEY": "k", "AIROUTER_MODEL_MAP": '{"claude-4-5-sonnet": "sonnet"}',
                               "AIROUTER_SELECT_TIMEOUT_MS": "750", "AIROUTER_EXCLUDE_MODELS": "a, b"})
     assert s.model_map == {"claude-4-5-sonnet": "sonnet"} and s.select_timeout_s == 0.75
-    assert s.exclude_models == {"a", "b"}
+    assert s.exclude_models == {"a", "b"} and s.shadow_models == frozenset() and not s.shadow_all
+    assert ar.Settings.from_env({"AIROUTER_SHADOW_MODELS": "mini, big"}).shadow_models == {"mini", "big"}
+    assert ar.Settings.from_env({"AIROUTER_SHADOW_MODELS": "*"}).shadow_all
     with pytest.raises(ValueError):
         ar.Settings.from_env({"AIROUTER_MODEL_MAP": '["x"]'})
 
@@ -199,6 +201,37 @@ async def test_effort_per_surface_and_client_value_wins(monkeypatch):
     assert resp["reasoning"] == {"effort": "low"} and resp["model"] == "big"
     anth = await cb.async_pre_call_hook(MASTER, None, chat(), "anthropic_messages")
     assert "reasoning_effort" not in anth and anth["model"] == "big"
+
+
+async def test_routed_reports_carry_the_effort_that_was_sent(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5.2", effort="low")
+    cb = make_callback(fake, monkeypatch)
+    data = await cb.async_pre_call_hook(MASTER, None, chat(reasoning_effort="high"), "acompletion")
+    assert data["metadata"][ar.METADATA_EFFORT] == "high"
+    kwargs = success_kwargs()
+    kwargs["litellm_params"]["metadata"] = data["metadata"]
+    await cb.async_log_success_event(kwargs, None, None, None)
+    await cb.flush()
+    assert fake.report_bodies[0]["reports"][0]["effort"] == "high"
+    anth = await cb.async_pre_call_hook(MASTER, None, chat(), "anthropic_messages")
+    assert anth["litellm_metadata"][ar.METADATA_EFFORT] is None  # provider default
+
+
+@pytest.mark.parametrize(
+    ("data", "call_type", "effort"),
+    [
+        ({"reasoning_effort": "low"}, "acompletion", "low"),
+        ({}, "acompletion", None),
+        ({"reasoning": {"effort": "high", "summary": "auto"}}, "aresponses", "high"),
+        ({"reasoning": {"summary": "auto"}}, "aresponses", None),
+        ({"output_config": {"effort": "xhigh"}, "thinking": {"type": "adaptive"}}, "anthropic_messages", "xhigh"),
+        ({"reasoning_effort": "medium"}, "anthropic_messages", "medium"),
+        ({"thinking": {"type": "enabled", "budget_tokens": 2048}}, "anthropic_messages", None),
+        ({"thinking": {"type": "enabled", "budget_tokens": 2048}}, "acompletion", None),
+    ],
+)
+def test_request_effort_per_surface(data, call_type, effort):
+    assert ar.request_effort(data, call_type) == effort
 
 
 # -- usage reporting
@@ -425,3 +458,197 @@ async def test_unknown_candidates_are_logged_once(monkeypatch, caplog):
     text = [r.getMessage() for r in caplog.records]
     assert sum("lists 'nope'" in t for t in text) == 1
     assert sum("lists virtual model 'auto-quality'" in t for t in text) == 1
+
+
+# -- shadow mode
+
+
+SHADOW_MODEL_LIST = MODEL_LIST + [
+    {"model_name": "auto-cheap", "litellm_params": {"model": "azure/prod-mini"},
+     "model_info": {"base_model": "azure/gpt-5-mini", "airouter": {"models": ["mini"]}}},
+]
+
+
+def shadow_callback(fake, monkeypatch, shadow="*", **settings):
+    return make_callback(fake, monkeypatch, model_list=SHADOW_MODEL_LIST,
+                         shadow_models=frozenset(shadow.split(",")), **settings)
+
+
+def observed(model="big", call_id="call-1", **extra):
+    return {"model": model, "litellm_call_id": call_id, "metadata": {"user": "u"},
+            "messages": [{"role": "user", "content": "explain entropy"}], **extra}
+
+
+def shadow_success(call_id="call-1", group="big"):
+    return {"litellm_call_id": call_id, "litellm_params": {"metadata": {"user": "u"}},
+            "standard_logging_object": {"model_group": group, "prompt_tokens": 120, "completion_tokens": 340,
+                                        "response_time": 1.25}}
+
+
+async def settle(cb):
+    import asyncio
+
+    tasks = [o.task for o in cb._observations.values()]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
+
+async def test_observed_request_is_not_modified_at_all(monkeypatch):
+    import copy
+
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch)
+    data = observed(max_tokens=500, tools=[{"type": "function"}], reasoning_effort="low")
+    before = copy.deepcopy(data)
+    returned = await cb.async_pre_call_hook(MASTER, None, data, "acompletion")
+    await settle(cb)
+    assert returned == before and data == before
+    [body] = fake.select_bodies
+    assert body == {"messages": [{"role": "user", "content": "explain entropy"}], "tools": True,
+                    "shadow": True, "max_tokens": 500, "model": "gpt-5.2"}
+
+
+async def test_hook_returns_before_a_slow_shadow_selection(monkeypatch):
+    import asyncio
+
+    fake = SlowAiRouter(select_delay=5.0, pick="gpt-5-mini")
+    cb = ar.AiRouterSelection(
+        settings=ar.Settings(api_key="test", base_url="https://airouter.test", shadow_models=frozenset({"big"})),
+        transport=httpx.MockTransport(fake.async_handler),
+    )
+    router = real_router(MODEL_LIST)
+    monkeypatch.setattr(ar.AiRouterSelection, "_proxy_router", staticmethod(lambda: router))
+    started = asyncio.get_running_loop().time()
+    await cb.async_pre_call_hook(MASTER, None, observed(), "acompletion")
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert cb._shadow_in_flight == 1
+    # the outcome arrives first; the report follows the decision without blocking the logging path
+    await cb.async_log_success_event(shadow_success(), None, None, None)
+    assert len(cb._reports) == 0
+    for observation in list(cb._observations.values()):
+        observation.task.cancel()
+
+
+async def test_shadow_report_contents(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch)
+    await cb.async_pre_call_hook(MASTER, None, observed(reasoning_effort="high"), "acompletion")
+    await settle(cb)
+    await cb.async_log_success_event(shadow_success(), None, None, None)
+    assert await cb.flush() is True
+    [report] = fake.report_bodies[0]["reports"]
+    assert report["decision_id"] == "d-1" and report["model"] == "gpt-5.2" and report["effort"] == "high"
+    assert (report["input_tokens"], report["output_tokens"], report["latency_ms"]) == (120, 340, 1250)
+    assert cb._observations == {}
+
+
+async def test_report_waits_for_a_decision_that_arrives_after_the_outcome(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch)
+    await cb.async_pre_call_hook(MASTER, None, observed(), "acompletion")
+    tasks = [o.task for o in cb._observations.values()]
+    await cb.async_log_success_event(shadow_success(), None, None, None)  # decision still pending
+    import asyncio
+
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+    await cb.flush()
+    assert fake.report_bodies[0]["reports"][0]["effort"] is None
+
+
+async def test_shadow_report_after_a_fallback_names_the_group_that_ran(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch, shadow="big")
+    await cb.async_pre_call_hook(MASTER, None, observed(), "acompletion")
+    await settle(cb)
+    await cb.async_log_failure_event({"litellm_call_id": "call-1"}, None, None, None)  # the failed first attempt
+    await cb.async_log_success_event(shadow_success(group="mini"), None, None, None)
+    await cb.flush()
+    assert fake.report_bodies[0]["reports"][0]["model"] == "gpt-5-mini"
+    assert fake.select_bodies[0]["model"] == "gpt-5.2"
+
+
+async def test_failed_request_is_dropped_after_the_fallback_grace(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch, shadow_failure_grace_s=0.0)
+    await cb.async_pre_call_hook(MASTER, None, observed(), "acompletion")
+    await settle(cb)
+    await cb.async_log_failure_event({"litellm_call_id": "call-1"}, None, None, None)
+    cb._evict_observations(ar.time.monotonic())
+    assert cb._observations == {}
+    await cb.async_log_success_event(shadow_success(), None, None, None)
+    assert len(cb._reports) == 0
+
+
+async def test_streaming_success_is_reported_like_any_other(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch)
+    await cb.async_pre_call_hook(MASTER, None, observed(stream=True, stream_options={"include_usage": True}),
+                                 "acompletion")
+    await settle(cb)
+    kwargs = shadow_success()
+    kwargs["stream"] = True
+    await cb.async_log_success_event(kwargs, None, None, None)
+    await cb.flush()
+    assert fake.report_bodies[0]["reports"][0]["output_tokens"] == 340
+
+
+async def test_overload_skips_without_queueing_and_logs_once_a_minute(monkeypatch, caplog):
+    fake = SlowAiRouter(select_delay=5.0, pick="gpt-5-mini")
+    cb = ar.AiRouterSelection(
+        settings=ar.Settings(api_key="test", base_url="https://airouter.test", shadow_models=frozenset({"*"}),
+                             shadow_max_concurrent=2),
+        transport=httpx.MockTransport(fake.async_handler),
+    )
+    router = real_router(MODEL_LIST)
+    monkeypatch.setattr(ar.AiRouterSelection, "_proxy_router", staticmethod(lambda: router))
+    for index in range(5):
+        await cb.async_pre_call_hook(MASTER, None, observed(call_id=f"call-{index}"), "acompletion")
+    assert set(cb._observations) == {"call-0", "call-1"}
+    assert caplog.text.count("shadow mode at capacity") == 1
+    for observation in cb._observations.values():
+        observation.task.cancel()
+
+
+async def test_pending_map_is_bounded_and_expires(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch, shadow_pending_limit=2)
+    for index in range(3):
+        await cb.async_pre_call_hook(MASTER, None, observed(call_id=f"call-{index}"), "acompletion")
+    await settle(cb)
+    assert set(cb._observations) == {"call-0", "call-1"}
+    for observation in cb._observations.values():
+        observation.created_at -= cb.settings.shadow_pending_ttl_s
+    await cb.async_pre_call_hook(MASTER, None, observed(call_id="call-9"), "acompletion")
+    assert set(cb._observations) == {"call-9"}
+
+
+async def test_unmapped_groups_and_virtual_models_are_not_observed(monkeypatch, caplog):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch)
+    await cb.async_pre_call_hook(MASTER, None, observed(model="local-qwen"), "acompletion")
+    await settle(cb)
+    await cb.async_log_success_event(shadow_success(group="local-qwen"), None, None, None)
+    await cb.async_pre_call_hook(MASTER, None, observed(model="local-qwen", call_id="call-2"), "acompletion")
+    await settle(cb)
+    assert fake.select_bodies == []
+    assert caplog.text.count("'local-qwen' has no AI Router catalog match and is not observed") == 1
+    routed = await cb.async_pre_call_hook(MASTER, None, observed(model="auto-cheap", call_id="call-3"), "acompletion")
+    assert routed["model"] == "mini" and "shadow" not in fake.select_bodies[0]
+
+
+async def test_only_listed_groups_are_observed(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = shadow_callback(fake, monkeypatch, shadow="mini")
+    await cb.async_pre_call_hook(MASTER, None, observed(model="big"), "acompletion")
+    await cb.async_pre_call_hook(MASTER, None, observed(model="mini", call_id="call-2"), "acompletion")
+    await settle(cb)
+    assert [body["model"] for body in fake.select_bodies] == ["gpt-5-mini"]
+
+
+async def test_shadow_mode_is_off_by_default(monkeypatch):
+    fake = FakeAiRouter(pick="gpt-5-mini")
+    cb = make_callback(fake, monkeypatch)
+    await cb.async_pre_call_hook(MASTER, None, observed(), "acompletion")
+    assert cb._observations == {} and fake.select_bodies == []
