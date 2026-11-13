@@ -6,6 +6,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PICK = sys.argv[2] if len(sys.argv) > 2 else "gpt-5.2"
+EFFORT = sys.argv[3] if len(sys.argv) > 3 else None
 CATALOG = ["gpt-5-mini", "gpt-5.2", "claude-4-5-sonnet"]
 
 
@@ -34,7 +35,7 @@ class Handler(BaseHTTPRequestHandler):
             # shadow decision ids are recognizable in the reports that refer to them
             decision_id = ("shadow-" if shadow else "") + str(uuid.uuid4())
             self._send(200, {"decision_id": decision_id, "predicted_savings": None, "candidates": [
-                {"model": pick, "effort": None, "quality": 1, "costs": 1, "latency": 1,
+                {"model": pick, "effort": None if shadow else EFFORT, "quality": 1, "costs": 1, "latency": 1,
                  "quality_score": 1, "costs_score": 1, "latency_score": 1, "score": 1}]})
         elif self.path == "/v1/usage-reports":
             print("REPORTS", json.dumps(body), flush=True)

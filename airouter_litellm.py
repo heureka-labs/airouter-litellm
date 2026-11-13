@@ -678,9 +678,28 @@ class AiRouterSelection(CustomLogger):
                 data["reasoning"] = {"effort": effort}
             elif isinstance(reasoning, dict):
                 reasoning.setdefault("effort", effort)
+        elif call_type in ANTHROPIC_CALL_TYPES:
+            # LiteLLM takes the effort of a messages request from adaptive thinking with
+            # output_config.effort on every path: Anthropic receives both as they are, OpenAI
+            # (Responses API bridge) reasoning.effort, other providers (chat completions bridge)
+            # reasoning_effort. A client's own thinking block that is not adaptive (a token
+            # budget, or thinking disabled) already decides how the model reasons.
+            if request_effort(data, call_type) is not None:
+                return
+            thinking = data.get("thinking")
+            output_config = data.get("output_config")
+            if thinking is not None and not (isinstance(thinking, dict) and thinking.get("type") == "adaptive"):
+                return
+            if output_config is not None and not isinstance(output_config, dict):
+                return
+            if thinking is None:
+                data["thinking"] = {"type": "adaptive"}
+            if output_config is None:
+                data["output_config"] = {"effort": effort}
+            else:
+                output_config["effort"] = effort
         elif call_type in CHAT_CALL_TYPES:
             data.setdefault("reasoning_effort", effort)
-        # Anthropic /v1/messages: no effort mapping, the provider default applies.
 
     # -- shadow mode
 

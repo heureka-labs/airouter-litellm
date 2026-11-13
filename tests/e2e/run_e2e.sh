@@ -6,7 +6,7 @@ BIN=${1:-/tmp/llm-venv/bin}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 LOG=$(mktemp -d)
-"$BIN/python" "$HERE/fake_airouter.py" 4012 gpt-5.2 >"$LOG/airouter.log" 2>&1 &
+"$BIN/python" "$HERE/fake_airouter.py" 4012 gpt-5.2 low >"$LOG/airouter.log" 2>&1 &
 FAKE=$!
 # Install the way the README describes it: the callback file next to config.yaml, no PYTHONPATH.
 cp "$HERE/config.yaml" "$ROOT/airouter_litellm.py" "$LOG/"
@@ -54,6 +54,7 @@ for line in sys.stdin:
         kind = "shadow" if report["decision_id"].startswith("shadow-") else "routed"
         print(kind, report["model"], report["effort"], report["input_tokens"] > 0)')
 check "usage reports delivered (6 routed calls)" "$(echo "$reports" | grep -c '^routed')" '^6$'
+check "routed reports carry the selected effort on every route" "$(echo "$reports" | grep -c '^routed [^ ]* low True')" '^6$'
 check "shadow reports delivered (5 observed calls)" "$(echo "$reports" | grep -c '^shadow')" '^5$'
 check "shadow selections marked, naming the requested model" "$(grep -c '^SHADOW-SELECT.*"shadow": true.*"model": "gpt-5-mini"' "$LOG/airouter.log")" '^4$'
 check "shadow selection of the fallback group names its own model" "$(grep '^SHADOW-SELECT' "$LOG/airouter.log")" '"model": "claude-4-5-sonnet"'

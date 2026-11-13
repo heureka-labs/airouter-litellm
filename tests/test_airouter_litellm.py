@@ -200,7 +200,37 @@ async def test_effort_per_surface_and_client_value_wins(monkeypatch):
     resp = await cb.async_pre_call_hook(MASTER, None, {"model": "airouter-auto", "input": "q"}, "aresponses")
     assert resp["reasoning"] == {"effort": "low"} and resp["model"] == "big"
     anth = await cb.async_pre_call_hook(MASTER, None, chat(), "anthropic_messages")
+    assert anth["thinking"] == {"type": "adaptive"} and anth["output_config"] == {"effort": "low"}
     assert "reasoning_effort" not in anth and anth["model"] == "big"
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        # no reasoning fields: adaptive thinking with the selected effort
+        ({}, {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}),
+        # adaptive thinking without an effort, structured output kept
+        ({"thinking": {"type": "adaptive", "display": "summarized"},
+          "output_config": {"format": {"type": "json_schema"}}},
+         {"thinking": {"type": "adaptive", "display": "summarized"},
+          "output_config": {"format": {"type": "json_schema"}, "effort": "low"}}),
+        # the client's own effort, in either form, wins
+        ({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}},
+         {"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}),
+        ({"reasoning_effort": "high"}, {"reasoning_effort": "high"}),
+        # a token budget or disabled thinking decides on its own
+        ({"thinking": {"type": "enabled", "budget_tokens": 2048}},
+         {"thinking": {"type": "enabled", "budget_tokens": 2048}}),
+        ({"thinking": {"type": "disabled"}}, {"thinking": {"type": "disabled"}}),
+    ],
+)
+async def test_messages_route_gets_the_selected_effort_as_adaptive_thinking(monkeypatch, extra, expected):
+    fake = FakeAiRouter(pick="gpt-5.2", effort="low")
+    cb = make_callback(fake, monkeypatch)
+    data = await cb.async_pre_call_hook(MASTER, None, chat(max_tokens=100, **extra), "anthropic_messages")
+    sent = {k: v for k, v in data.items() if k in ("thinking", "output_config", "reasoning_effort")}
+    assert data["model"] == "big" and sent == expected
+    assert data["litellm_metadata"][ar.METADATA_EFFORT] == ar.request_effort(data, "anthropic_messages")
 
 
 async def test_routed_reports_carry_the_effort_that_was_sent(monkeypatch):
@@ -214,7 +244,10 @@ async def test_routed_reports_carry_the_effort_that_was_sent(monkeypatch):
     await cb.flush()
     assert fake.report_bodies[0]["reports"][0]["effort"] == "high"
     anth = await cb.async_pre_call_hook(MASTER, None, chat(), "anthropic_messages")
-    assert anth["litellm_metadata"][ar.METADATA_EFFORT] is None  # provider default
+    assert anth["litellm_metadata"][ar.METADATA_EFFORT] == "low"
+    budget = chat(thinking={"type": "enabled", "budget_tokens": 2048})
+    anth = await cb.async_pre_call_hook(MASTER, None, budget, "anthropic_messages")
+    assert anth["litellm_metadata"][ar.METADATA_EFFORT] is None  # no effort level was sent
 
 
 @pytest.mark.parametrize(
@@ -541,6 +574,24 @@ async def test_shadow_report_contents(monkeypatch):
     assert report["decision_id"] == "d-1" and report["model"] == "gpt-5.2" and report["effort"] == "high"
     assert (report["input_tokens"], report["output_tokens"], report["latency_ms"]) == (120, 340, 1250)
     assert cb._observations == {}
+
+
+async def test_observed_messages_request_reports_the_clients_own_effort(monkeypatch):
+    import copy
+
+    fake = FakeAiRouter(pick="gpt-5-mini", effort="low")
+    cb = shadow_callback(fake, monkeypatch)
+    data = observed(max_tokens=100, thinking={"type": "adaptive"}, output_config={"effort": "xhigh"})
+    plain = observed(call_id="call-2", max_tokens=100)
+    before = copy.deepcopy([data, plain])
+    await cb.async_pre_call_hook(MASTER, None, data, "anthropic_messages")
+    await cb.async_pre_call_hook(MASTER, None, plain, "anthropic_messages")
+    await settle(cb)
+    assert [data, plain] == before
+    await cb.async_log_success_event(shadow_success(), None, None, None)
+    await cb.async_log_success_event(shadow_success(call_id="call-2"), None, None, None)
+    await cb.flush()
+    assert [r["effort"] for r in fake.report_bodies[0]["reports"]] == ["xhigh", None]
 
 
 async def test_report_waits_for_a_decision_that_arrives_after_the_outcome(monkeypatch):

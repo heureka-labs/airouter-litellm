@@ -242,8 +242,13 @@ Routed calls appear in the AI Router dashboard.
 
 - **Reasoning effort.** If the AI Router selects an effort level, it is passed on as
   `reasoning_effort` (chat) or `reasoning.effort` (Responses API), unless the client set
-  one itself. Anthropic-format requests keep the provider default. Usage reports carry
-  the effort that was actually sent, so the AI Router can tell which stage ran.
+  one itself. Anthropic-format requests (`/v1/messages`) get adaptive thinking with
+  `output_config.effort`, the form LiteLLM reads on that route: Anthropic receives it as
+  is, OpenAI models receive it as `reasoning.effort`, other providers as
+  `reasoning_effort`. A client's own effort there (`output_config.effort` or
+  `reasoning_effort`), or its own thinking block with a token budget or thinking disabled,
+  is left as it is. Usage reports carry the effort that was actually sent, so the AI
+  Router can tell which stage ran.
 - **Which virtual model was called.** The rewrite replaces the requested model, so the
   callback adds `airouter_virtual_model` to the request metadata, where other LiteLLM
   callbacks can read it.
