@@ -18,6 +18,12 @@ After each executed call the token usage is queued and reported to
 ``/v1/usage-reports`` in the background, so the AI Router dashboard shows actual
 usage and savings.
 
+Shadow mode (``AIROUTER_SHADOW_MODELS``) observes requests to regular model groups
+without changing them: the AI Router ranks each observed request in the background
+and records its decision as a shadow decision, the request runs on the model the
+client asked for, and its usage is reported against that decision. The pilot report
+then compares what ran with what the AI Router would have chosen.
+
 Install: put this file next to the proxy's config.yaml (or ``pip install``) and add
 ``airouter_litellm.selection`` to ``litellm_settings.callbacks``. Configuration is
 read from environment variables, see README.md.
@@ -49,7 +55,7 @@ except ImportError:  # pragma: no cover - allows unit tests without litellm
             pass
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logger = logging.getLogger("airouter_litellm")
 if os.environ.get("AIROUTER_LOG_LEVEL"):
@@ -62,6 +68,7 @@ if os.environ.get("AIROUTER_LOG_LEVEL"):
 METADATA_DECISION_ID = "airouter_decision_id"
 METADATA_MODEL = "airouter_model"
 METADATA_VIRTUAL_MODEL = "airouter_virtual_model"
+METADATA_EFFORT = "airouter_effort"
 
 CONFIG_KEY = "airouter"  # model_info block that makes a model_list entry a virtual model
 WEIGHTING_KEYS = frozenset({"quality", "costs", "latency"})
@@ -89,6 +96,17 @@ class Settings:
     report_flush_interval_s: float = 5.0
     report_batch_size: int = 500
     report_queue_limit: int = 50_000
+    # model groups observed in shadow mode; "*" observes every group that maps to the catalog
+    shadow_models: frozenset[str] = frozenset()
+    shadow_select_timeout_s: float = 30.0  # covers a cold start of the AI Router's prediction service
+    shadow_max_concurrent: int = 16
+    shadow_pending_limit: int = 10_000
+    shadow_pending_ttl_s: float = 900.0
+    shadow_failure_grace_s: float = 120.0  # a failed attempt can still be followed by a successful fallback
+
+    @property
+    def shadow_all(self) -> bool:
+        return "*" in self.shadow_models
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -106,6 +124,9 @@ class Settings:
         exclude = frozenset(
             name.strip() for name in env.get("AIROUTER_EXCLUDE_MODELS", "").split(",") if name.strip()
         )
+        shadow = frozenset(
+            name.strip() for name in env.get("AIROUTER_SHADOW_MODELS", "").split(",") if name.strip()
+        )
         return cls(
             api_key=api_key,
             base_url=env.get("AIROUTER_BASE_URL", cls.base_url).rstrip("/"),
@@ -113,6 +134,7 @@ class Settings:
             select_timeout_s=float(env.get("AIROUTER_SELECT_TIMEOUT_MS", "2000")) / 1000,
             model_map=model_map,
             exclude_models=exclude,
+            shadow_models=shadow,
         )
 
 
@@ -173,6 +195,30 @@ def selection_messages(data: dict[str, Any]) -> list[dict[str, str]]:
                 elif item.get("type") == "function_call_output":
                     add("tool", item.get("output"))
     return out
+
+
+def request_effort(data: dict[str, Any], call_type: str) -> str | None:
+    """The reasoning effort a request sends to its provider, None when it sends none.
+
+    Chat completions carry ``reasoning_effort``, the Responses API ``reasoning.effort``,
+    Anthropic ``/v1/messages`` ``output_config.effort`` (or LiteLLM's ``reasoning_effort``
+    alias). Budget-style thinking (``thinking: {"type": "enabled", "budget_tokens": n}``)
+    names no effort level and counts as none.
+    """
+    effort: Any = None
+    if call_type in RESPONSES_CALL_TYPES:
+        reasoning = data.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+    elif call_type in ANTHROPIC_CALL_TYPES:
+        output_config = data.get("output_config")
+        if isinstance(output_config, dict):
+            effort = output_config.get("effort")
+        if effort is None:
+            effort = data.get("reasoning_effort")
+    else:
+        effort = data.get("reasoning_effort")
+    return effort if isinstance(effort, str) and effort else None
 
 
 def _max_tokens(data: dict[str, Any]) -> int | None:
@@ -358,6 +404,16 @@ def find_virtual_models(deployments: list[dict[str, Any]], settings: Settings) -
 # ------------------------------------------------------------------------ callback
 
 
+@dataclass
+class Observation:
+    """A request observed in shadow mode, waiting for its decision and its outcome."""
+
+    task: "asyncio.Task[str | None]"
+    effort: str | None
+    created_at: float
+    failed_at: float | None = None
+
+
 class AiRouterSelection(CustomLogger):
     def __init__(self, settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None):
         super().__init__()
@@ -375,6 +431,9 @@ class AiRouterSelection(CustomLogger):
         self._warned: set[str] = set()
         self._reports: deque[dict[str, Any]] = deque()
         self._flusher: asyncio.Task[None] | None = None
+        self._observations: dict[str, Observation] = {}
+        self._shadow_in_flight = 0
+        self._shadow_skip_logged_at: float | None = None
 
     # -- infrastructure
 
@@ -513,12 +572,17 @@ class AiRouterSelection(CustomLogger):
     # -- request path
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> dict:
+        call_type = str(getattr(call_type, "value", call_type))
+        try:
+            self._observe(data, call_type)  # never awaits: an observed request does not wait for the AI Router
+        except Exception as exc:
+            logger.warning("airouter: shadow observation skipped: %r", exc)
         # One budget for the whole selection step (catalog, access checks, decision), so
         # AIROUTER_SELECT_TIMEOUT_MS is the most a request can ever wait for the AI Router.
         # _select mutates data only after its last await, so a timeout leaves it untouched.
         try:
             return await asyncio.wait_for(
-                self._select(user_api_key_dict, data, str(getattr(call_type, "value", call_type))),
+                self._select(user_api_key_dict, data, call_type),
                 timeout=self.settings.select_timeout_s,
             )
         except asyncio.TimeoutError:
@@ -576,6 +640,7 @@ class AiRouterSelection(CustomLogger):
             return data
         data["model"] = target
         self._apply_effort(data, call_type, best.get("effort"))
+        effort = request_effort(data, call_type)
         # On Anthropic and Responses routes "metadata" is a provider parameter that would be
         # forwarded upstream; LiteLLM's own request metadata lives in "litellm_metadata" there.
         metadata_key = "metadata" if call_type in CHAT_CALL_TYPES else "litellm_metadata"
@@ -587,6 +652,7 @@ class AiRouterSelection(CustomLogger):
             if decision.get("decision_id"):
                 metadata[METADATA_DECISION_ID] = decision["decision_id"]
                 metadata[METADATA_MODEL] = best["model"]
+                metadata[METADATA_EFFORT] = effort
         logger.info(
             "airouter: %s -> %s (%s) in %.0f ms",
             virtual.name, target, best.get("model"), (time.monotonic() - started) * 1000,
@@ -612,17 +678,154 @@ class AiRouterSelection(CustomLogger):
                 data["reasoning"] = {"effort": effort}
             elif isinstance(reasoning, dict):
                 reasoning.setdefault("effort", effort)
+        elif call_type in ANTHROPIC_CALL_TYPES:
+            # LiteLLM takes the effort of a messages request from adaptive thinking with
+            # output_config.effort on every path: Anthropic receives both as they are, OpenAI
+            # (Responses API bridge) reasoning.effort, other providers (chat completions bridge)
+            # reasoning_effort. A client's own thinking block that is not adaptive (a token
+            # budget, or thinking disabled) already decides how the model reasons.
+            if request_effort(data, call_type) is not None:
+                return
+            thinking = data.get("thinking")
+            output_config = data.get("output_config")
+            if thinking is not None and not (isinstance(thinking, dict) and thinking.get("type") == "adaptive"):
+                return
+            if output_config is not None and not isinstance(output_config, dict):
+                return
+            if thinking is None:
+                data["thinking"] = {"type": "adaptive"}
+            if output_config is None:
+                data["output_config"] = {"effort": effort}
+            else:
+                output_config["effort"] = effort
         elif call_type in CHAT_CALL_TYPES:
             data.setdefault("reasoning_effort", effort)
-        # Anthropic /v1/messages: no effort mapping, the provider default applies.
+
+    # -- shadow mode
+
+    def _is_observed(self, group: str, llm_router: Any) -> bool:
+        settings = self.settings
+        if not settings.shadow_models or group in self.virtual_models(llm_router):
+            return False
+        return settings.shadow_all or group in settings.shadow_models
+
+    def _observe(self, data: dict, call_type: str) -> None:
+        """Start a shadow selection for an observed request and return at once.
+
+        The request is only read, never changed (not even its metadata): the decision is
+        correlated with the outcome by LiteLLM's ``litellm_call_id``. Observations are
+        bounded; beyond the limits a request is not observed, nothing waits in a queue.
+        """
+        settings = self.settings
+        group = data.get("model")
+        call_id = data.get("litellm_call_id")
+        if not settings.shadow_models or not isinstance(group, str) or call_type not in SUPPORTED_CALL_TYPES:
+            return
+        if not isinstance(call_id, str) or not settings.api_key:
+            return
+        llm_router = self._proxy_router()
+        if not self._is_observed(group, llm_router):
+            return
+        messages = selection_messages(data)
+        if not messages:
+            return
+        now = time.monotonic()
+        self._evict_observations(now)
+        if (
+            self._shadow_in_flight >= settings.shadow_max_concurrent
+            or len(self._observations) >= settings.shadow_pending_limit
+        ):
+            if self._shadow_skip_logged_at is None or now - self._shadow_skip_logged_at >= 60.0:
+                self._shadow_skip_logged_at = now
+                logger.warning(
+                    "airouter: shadow mode at capacity (%d selections in flight, %d pending), "
+                    "requests are not observed until it drains",
+                    self._shadow_in_flight, len(self._observations),
+                )
+            return
+        body: dict[str, Any] = {"messages": messages, "tools": bool(data.get("tools")), "shadow": True}
+        max_tokens = _max_tokens(data)
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        self._shadow_in_flight += 1
+        task = asyncio.get_running_loop().create_task(self._shadow_select(group, body, llm_router))
+        task.add_done_callback(self._shadow_select_done)
+        self._observations[call_id] = Observation(task=task, effort=request_effort(data, call_type), created_at=now)
+
+    def _shadow_select_done(self, task: "asyncio.Task[str | None]") -> None:
+        self._shadow_in_flight -= 1
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("airouter: shadow selection failed: %r", task.exception())
+
+    async def _shadow_select(self, group: str, body: dict[str, Any], llm_router: Any) -> str | None:
+        """The decision id of a shadow selection for ``group``'s catalog model, None without one."""
+        mapping = await self.mapping(llm_router)
+        catalog_model = mapping.to_catalog.get(group)
+        if catalog_model is None:
+            self._warn_once("airouter: model group %r has no AI Router catalog match and is not observed", group)
+            return None
+        response = await self._http().post(
+            "/v1/select", json={**body, "model": catalog_model}, timeout=self.settings.shadow_select_timeout_s
+        )
+        response.raise_for_status()
+        decision_id = response.json().get("decision_id")
+        return decision_id if isinstance(decision_id, str) else None
+
+    def _evict_observations(self, now: float) -> None:
+        settings = self.settings
+        expired = [
+            call_id for call_id, observation in self._observations.items()
+            if now - observation.created_at >= settings.shadow_pending_ttl_s
+            or (observation.failed_at is not None and now - observation.failed_at >= settings.shadow_failure_grace_s)
+        ]
+        for call_id in expired:
+            del self._observations[call_id]
+
+    def _complete_observation(self, kwargs: dict) -> None:
+        """Report an observed request's usage once its shadow decision is known (never waits for it)."""
+        observation = self._observations.pop(kwargs.get("litellm_call_id"), None)
+        if observation is None:
+            return
+        payload = kwargs.get("standard_logging_object") or {}
+        executed_group = payload.get("model_group")  # after a LiteLLM fallback: the group that ran
+
+        def queue(task: "asyncio.Task[str | None]") -> None:
+            if task.cancelled() or task.exception() is not None or not task.result():
+                return
+            # the finished selection has loaded the mapping
+            model = self._mapping.to_catalog.get(executed_group) if self._mapping is not None else None
+            if model is None:
+                self._warn_once(
+                    "airouter: model group %r has no AI Router catalog match, its shadow usage is not reported",
+                    executed_group,
+                )
+                return
+            self._enqueue({**self._report(model, observation.effort, payload), "decision_id": task.result()})
+
+        if observation.task.done():
+            queue(observation.task)
+        else:
+            observation.task.add_done_callback(queue)
+
+    def _fail_observation(self, kwargs: dict) -> None:
+        observation = self._observations.get(kwargs.get("litellm_call_id"))
+        if observation is not None and observation.failed_at is None:
+            observation.failed_at = time.monotonic()
 
     # -- usage reporting
 
     async def async_log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         try:
             self._queue_report(kwargs)
+            self._complete_observation(kwargs)
         except Exception as exc:
             logger.warning("airouter: usage report not queued: %r", exc)
+
+    async def async_log_failure_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
+        try:
+            self._fail_observation(kwargs)
+        except Exception as exc:
+            logger.warning("airouter: shadow observation not closed: %r", exc)
 
     def _queue_report(self, kwargs: dict) -> None:
         litellm_params = kwargs.get("litellm_params") or {}
@@ -641,14 +844,20 @@ class AiRouterSelection(CustomLogger):
             model = self._mapping.to_catalog[executed_group]  # a LiteLLM fallback may have changed it
         if not model:
             return
-        report = {
+        self._enqueue({**self._report(model, metadata.get(METADATA_EFFORT), payload), "decision_id": decision_id})
+
+    @staticmethod
+    def _report(model: str, effort: str | None, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
             "report_id": str(uuid.uuid4()),
-            "decision_id": decision_id,
             "model": model,
+            "effort": effort,
             "input_tokens": int(payload.get("prompt_tokens") or 0),
             "output_tokens": int(payload.get("completion_tokens") or 0),
             "latency_ms": int(float(payload.get("response_time") or 0) * 1000),
         }
+
+    def _enqueue(self, report: dict[str, Any]) -> None:
         if len(self._reports) >= self.settings.report_queue_limit:
             self._reports.popleft()
             logger.warning("airouter: usage report queue full, dropped the oldest report")

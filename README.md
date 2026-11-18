@@ -59,12 +59,12 @@ Install into the environment the proxy runs in, or into your own image based on 
 LiteLLM image:
 
 ```bash
-pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.2.0"
+pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.3.0"
 ```
 
 ```dockerfile
 FROM ghcr.io/berriai/litellm:<version>
-RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.2.0"
+RUN pip install "git+https://github.com/heureka-labs/airouter-litellm@v0.3.0"
 ```
 
 ## Configuration
@@ -140,6 +140,7 @@ If you already have callbacks, add it to the list:
 | `AIROUTER_SELECT_TIMEOUT_MS` | no | `2000` | Time budget for the whole selection step; when exceeded, the default model answers |
 | `AIROUTER_MODEL_MAP` | no | | JSON object from AI Router model name to your model name, e.g. `{"claude-4-5-sonnet": "vertex-sonnet"}` |
 | `AIROUTER_EXCLUDE_MODELS` | no | | Comma-separated model names that must never be selected |
+| `AIROUTER_SHADOW_MODELS` | no | | Comma-separated model names observed in [shadow mode](#shadow-mode), or `*` for every model that maps to the AI Router catalog. Empty: shadow mode is off |
 | `AIROUTER_LOG_LEVEL` | no | | `INFO` logs every selection, `WARNING` only problems |
 | `AIROUTER_BASE_URL` | no | `https://api.airouter.io` | API endpoint |
 
@@ -172,6 +173,39 @@ and `litellm_params.model` with the AI Router catalog, after removing provider p
   [support@airouter.io](mailto:support@airouter.io) to add the model to the catalog,
   for example a self-hosted model.
 
+## Shadow mode
+
+Shadow mode lets you see what the AI Router would do with your live traffic before it
+changes anything. Requests to the models listed in `AIROUTER_SHADOW_MODELS` (or to every
+model with a catalog match, with `*`) are observed:
+
+- The request is not changed in any way, not even its metadata. It runs on the model
+  the client asked for, with LiteLLM's own fallbacks.
+- In the background the AI Router ranks the request as it would for routing and records
+  its decision as a shadow decision. The request never waits for it: an AI Router that
+  is slow, down or rejects the call changes nothing about the request.
+- After the call, its usage is reported against that decision, with the model that
+  actually answered (after a LiteLLM fallback, the fallback) and the reasoning effort
+  the client sent.
+- The pilot report (`GET /v1/pilot-report` of the AI Router API) compares what ran with
+  what the AI Router would have chosen, per request, with the alternative's own predicted
+  output length. Shadow decisions are not routed usage and do not count toward billing.
+
+Requirements: an AI Router organization on the pilot plan (other plans record the
+decisions but store no ranking for the report). Virtual models are never observed; they
+route as before. A model without a catalog match is not observed (logged once).
+
+Reported effort per request format: `reasoning_effort` (chat completions),
+`reasoning.effort` (Responses API), `output_config.effort` or `reasoning_effort`
+(Anthropic `/v1/messages`). A request without one, including budget-style thinking
+(`thinking: {"type": "enabled", "budget_tokens": ...}`), reports no effort, and the AI
+Router applies the provider's default for that model.
+
+Observation is bounded: at most 16 shadow selections run at once and at most 10,000
+requests wait for their outcome (entries expire after 15 minutes). Beyond that, requests
+are not observed (no queueing), and a warning is logged at most once a minute. Each
+shadow selection may take up to 30 seconds.
+
 ## What is sent to the AI Router
 
 - Per routed request: the text content of the messages (system, user, assistant and
@@ -180,6 +214,9 @@ and `litellm_params.model` with the AI Router catalog, after removing provider p
   if set.
 - Per executed call: decision id, model name, input and output token counts from the
   provider's usage, and latency.
+- Per request observed in shadow mode: the same message text as for a routed request,
+  the catalog name of the requested model, whether tools are present and `max_tokens`;
+  after the call its usage as above plus the reasoning effort the client sent.
 - Nothing about requests to other models, and never provider keys.
 
 ## Verify
@@ -205,12 +242,18 @@ Routed calls appear in the AI Router dashboard.
 
 - **Reasoning effort.** If the AI Router selects an effort level, it is passed on as
   `reasoning_effort` (chat) or `reasoning.effort` (Responses API), unless the client set
-  one itself. Anthropic-format requests keep the provider default.
+  one itself. Anthropic-format requests (`/v1/messages`) get adaptive thinking with
+  `output_config.effort`, the form LiteLLM reads on that route: Anthropic receives it as
+  is, OpenAI models receive it as `reasoning.effort`, other providers as
+  `reasoning_effort`. A client's own effort there (`output_config.effort` or
+  `reasoning_effort`), or its own thinking block with a token budget or thinking disabled,
+  is left as it is. Usage reports carry the effort that was actually sent, so the AI
+  Router can tell which stage ran.
 - **Which virtual model was called.** The rewrite replaces the requested model, so the
   callback adds `airouter_virtual_model` to the request metadata, where other LiteLLM
   callbacks can read it.
 - **Fallbacks.** If LiteLLM falls back to another model after the selection, usage is
-  reported for the model that actually answered.
+  reported for the model that actually answered, in routing and in shadow mode.
 - **Delivery of usage reports.** Reports are sent in batches every few seconds and
   retried on network errors, HTTP 429 and 5xx. They are kept in memory only, so reports
   still queued when the proxy stops are lost.
